@@ -2,22 +2,35 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/gravitational/teleport-plugins/access"
 	"github.com/gravitational/teleport-plugins/lib"
 	"github.com/gravitational/teleport-plugins/lib/logger"
+	"github.com/gravitational/teleport/api/client"
+	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/types"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 
 	"github.com/gravitational/trace"
 )
 
-// MinServerVersion is the minimal teleport version the plugin supports.
-const MinServerVersion = "5.0.0"
+const (
+	// minServerVersion is the minimal teleport version the plugin supports.
+	minServerVersion = "5.0.0"
+	// pluginName is used to tag PluginData and as a Delegator in Audit log.
+	pluginName = "jira"
+	// backoffMaxDelay is a maximum time GRPC client waits before reconnection attempt.
+	backoffMaxDelay = time.Second * 2
+	// initTimeout is used to bound execution time of health check and teleport version check.
+	initTimeout = time.Second * 10
+	// handlerTimeout is used to bound the execution time of watcher event handler.
+	handlerTimeout = time.Second * 5
+)
 
 var resolveReasonInlineRegex = regexp.MustCompile(`(?im)^ *(resolution|reason) *: *(.+)$`)
 var resolveReasonSeparatorRegex = regexp.MustCompile(`(?im)^ *(resolution|reason) *: *$`)
@@ -26,10 +39,10 @@ var resolveReasonSeparatorRegex = regexp.MustCompile(`(?im)^ *(resolution|reason
 type App struct {
 	conf Config
 
-	accessClient access.Client
-	bot          *Bot
-	webhookSrv   *WebhookServer
-	mainJob      lib.ServiceJob
+	apiClient  *client.Client
+	bot        *Bot
+	webhookSrv *WebhookServer
+	mainJob    lib.ServiceJob
 
 	*lib.Process
 }
@@ -70,55 +83,10 @@ func (a *App) run(ctx context.Context) (err error) {
 	log := logger.Get(ctx)
 	log.Infof("Starting Teleport Access JIRAbot %s:%s", Version, Gitref)
 
-	// Create webhook server prividing a.OnJIRAWebhook as a callback function
-	a.webhookSrv, err = NewWebhookServer(a.conf.HTTP, a.onJIRAWebhook)
-	if err != nil {
-		return
-	}
-
-	a.bot = NewBot(a.conf.JIRA)
-
-	tlsConf, err := access.LoadTLSConfig(
-		a.conf.Teleport.ClientCrt,
-		a.conf.Teleport.ClientKey,
-		a.conf.Teleport.RootCAs,
-	)
-	if trace.Unwrap(err) == access.ErrInvalidCertificate {
-		log.WithError(err).Warning("Auth client TLS configuration error")
-	} else if err != nil {
-		return err
-	}
-
-	bk := backoff.DefaultConfig
-	bk.MaxDelay = time.Second * 2
-	a.accessClient, err = access.NewClient(
-		ctx,
-		"jira",
-		a.conf.Teleport.AuthServer,
-		tlsConf,
-		grpc.WithConnectParams(grpc.ConnectParams{
-			Backoff: bk,
-		}),
-	)
-	if err != nil {
+	if err = a.init(ctx); err != nil {
 		return trace.Wrap(err)
 	}
-	if err = a.checkTeleportVersion(ctx); err != nil {
-		return
-	}
 
-	log.Debug("Starting JIRA API health check...")
-	if err = a.bot.HealthCheck(ctx); err != nil {
-		log.WithError(err).Error("JIRA API health check failed")
-		a.Terminate()
-		return
-	}
-	log.Debug("JIRA API health check finished ok")
-
-	err = a.webhookSrv.EnsureCert()
-	if err != nil {
-		return
-	}
 	httpJob := a.webhookSrv.ServiceJob()
 	a.SpawnCriticalJob(httpJob)
 	httpOk, err := httpJob.WaitReady(ctx)
@@ -126,9 +94,12 @@ func (a *App) run(ctx context.Context) (err error) {
 		return
 	}
 
-	watcherJob := access.NewWatcherJob(
-		a.accessClient,
-		access.Filter{State: access.StatePending},
+	filter := types.AccessRequestFilter{State: types.RequestState_PENDING}
+	watcherJob := lib.NewWatcherJob(
+		a.apiClient,
+		types.Watch{Kinds: []types.WatchKind{
+			types.WatchKind{Kind: types.KindAccessRequest, Filter: filter.IntoMap()}},
+		},
 		a.onWatcherEvent,
 	)
 	a.SpawnCriticalJob(watcherJob)
@@ -145,52 +116,98 @@ func (a *App) run(ctx context.Context) (err error) {
 	return trace.NewAggregate(httpJob.Err(), watcherJob.Err())
 }
 
-func (a *App) checkTeleportVersion(ctx context.Context) error {
-	log := logger.Get(ctx)
-	log.Debug("Checking Teleport server version")
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+func (a *App) init(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
-	pong, err := a.accessClient.Ping(ctx)
-	if err != nil {
-		if trace.IsNotImplemented(err) {
-			return trace.Wrap(err, "server version must be at least %s", MinServerVersion)
-		}
-		log.Error("Unable to get Teleport server version")
+	log := logger.Get(ctx)
+
+	var (
+		err  error
+		pong proto.PingResponse
+	)
+
+	bk := backoff.DefaultConfig
+	bk.MaxDelay = backoffMaxDelay
+	if a.apiClient, err = client.New(ctx, client.Config{
+		Addrs:       []string{a.conf.Teleport.AuthServer},
+		Credentials: a.conf.Teleport.Credentials(),
+		DialOpts:    []grpc.DialOption{grpc.WithConnectParams(grpc.ConnectParams{Backoff: bk, MinConnectTimeout: initTimeout})},
+	}); err != nil {
 		return trace.Wrap(err)
 	}
-	a.bot.clusterName = pong.ClusterName
-	err = pong.AssertServerVersion(MinServerVersion)
-	return trace.Wrap(err)
+
+	if pong, err = a.checkTeleportVersion(ctx); err != nil {
+		return trace.Wrap(err)
+	}
+
+	a.bot = NewBot(a.conf.JIRA, pong.ClusterName)
+	log.Debug("Starting JIRA API health check...")
+	if err = a.bot.HealthCheck(ctx); err != nil {
+		return trace.Wrap(err, "api health check failed")
+	}
+	log.Debug("JIRA API health check finished ok")
+
+	// Create webhook server providing a.OnJIRAWebhook as a callback function
+	if a.webhookSrv, err = NewWebhookServer(a.conf.HTTP, a.onJIRAWebhook); err != nil {
+		return trace.Wrap(err)
+	}
+	if err = a.webhookSrv.EnsureCert(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	return nil
 }
 
-func (a *App) onWatcherEvent(ctx context.Context, event access.Event) error {
-	req, op := event.Request, event.Type
-	ctx = logger.SetField(ctx, "request_id", req.ID)
+func (a *App) checkTeleportVersion(ctx context.Context) (proto.PingResponse, error) {
+	log := logger.Get(ctx)
+	log.Debug("Checking Teleport server version")
+	pong, err := a.apiClient.WithCallOptions(grpc.WaitForReady(true)).Ping(ctx)
+	if err != nil {
+		if trace.IsNotImplemented(err) {
+			return pong, trace.Wrap(err, "server version must be at least %s", minServerVersion)
+		}
+		log.Error("Unable to get Teleport server version")
+		return pong, trace.Wrap(err)
+	}
+	err = lib.AssertServerVersion(pong, minServerVersion)
+	return pong, trace.Wrap(err)
+}
+
+func (a *App) onWatcherEvent(ctx context.Context, event types.Event) error {
+	ctx, cancel := context.WithTimeout(ctx, handlerTimeout)
+	defer cancel()
+
+	if kind := event.Resource.GetKind(); kind != types.KindAccessRequest {
+		return trace.Errorf("unexpected kind %q", kind)
+	}
+	op := event.Type
+	reqID := event.Resource.GetName()
+	ctx, _ = logger.WithField(ctx, "request_id", reqID)
 
 	switch op {
-	case access.OpPut:
+	case types.OpPut:
 		ctx, log := logger.WithField(ctx, "request_op", "put")
+		req, ok := event.Resource.(types.AccessRequest)
+		if !ok {
+			return trace.Errorf("unexpected resource type %T", event.Resource)
+		}
 
-		if !req.State.IsPending() {
+		if !req.GetState().IsPending() {
 			log.WithField("event", event).Warn("non-pending request event")
 			return nil
 		}
 
 		if err := a.onPendingRequest(ctx, req); err != nil {
-			log := log.WithError(err)
-			log.Errorf("Failed to process pending request")
-			log.Debugf("%v", trace.DebugReport(err))
-			return err
+			log.WithError(err).Errorf("Failed to process pending request")
+			return trace.Wrap(err)
 		}
 		return nil
-	case access.OpDelete:
+	case types.OpDelete:
 		ctx, log := logger.WithField(ctx, "request_op", "delete")
 
-		if err := a.onDeletedRequest(ctx, req); err != nil {
-			log := log.WithError(err)
-			log.Errorf("Failed to process deleted request")
-			log.Debugf("%v", trace.DebugReport(err))
-			return err
+		if err := a.onDeletedRequest(ctx, reqID); err != nil {
+			log.WithError(err).Errorf("Failed to process deleted request")
+			return trace.Wrap(err)
 		}
 		return nil
 	default:
@@ -232,17 +249,17 @@ func (a *App) onJIRAWebhook(ctx context.Context, webhook Webhook) error {
 	}
 	ctx, log = logger.WithField(ctx, "request_id", reqID)
 
-	req, err := a.accessClient.GetRequest(ctx, reqID)
+	reqs, err := a.apiClient.GetAccessRequests(ctx, types.AccessRequestFilter{ID: reqID})
 	if err != nil {
-		if trace.IsNotFound(err) {
-			log.WithError(err).Warning("Cannot process expired request")
-			return nil
-		}
 		return trace.Wrap(err)
 	}
+	if len(reqs) == 0 {
+		log.Warning("Cannot process expired request")
+	}
+	req := reqs[0]
 
-	if req.State != access.StatePending {
-		log.WithField("request_state", req.State).Warningf("Cannot process not pending request")
+	if !req.GetState().IsPending() {
+		log.WithField("request_state", req.GetState()).Warningf("Cannot process not pending request")
 		return nil
 	}
 
@@ -262,13 +279,16 @@ func (a *App) onJIRAWebhook(ctx context.Context, webhook Webhook) error {
 	}
 
 	var (
-		params     access.RequestStateParams
 		resolution string
+		delegator  string
 	)
+	params := types.AccessRequestUpdate{
+		RequestID: req.GetName(),
+	}
 
 	issueUpdate, err := issue.GetLastUpdate(statusName)
 	if err == nil {
-		params.Delegator = issueUpdate.Author.EmailAddress
+		delegator = fmt.Sprintf("%s:%s", pluginName, issueUpdate.Author.EmailAddress)
 
 		accountID := issueUpdate.Author.AccountID
 		err := a.bot.RangeIssueCommentsDescending(ctx, issue.ID, func(page PageOfComments) bool {
@@ -297,21 +317,21 @@ func (a *App) onJIRAWebhook(ctx context.Context, webhook Webhook) error {
 	ctx, log = logger.WithFields(ctx, logger.Fields{
 		"jira_user_email": issueUpdate.Author.EmailAddress,
 		"jira_user_name":  issueUpdate.Author.DisplayName,
-		"request_user":    req.User,
-		"request_roles":   req.Roles,
+		"request_user":    req.GetUser(),
+		"request_roles":   req.GetRoles(),
 		"reason":          params.Reason,
 	})
 
 	switch statusName {
 	case "approved":
-		params.State = access.StateApproved
+		params.State = types.RequestState_APPROVED
 		resolution = "approved"
 	case "denied":
-		params.State = access.StateDenied
+		params.State = types.RequestState_DENIED
 		resolution = "denied"
 	}
 
-	if err := a.accessClient.SetRequestStateExt(ctx, req.ID, params); err != nil {
+	if err := a.apiClient.SetAccessRequestState(client.WithDelegator(ctx, delegator), params); err != nil {
 		return trace.Wrap(err)
 	}
 	log.Infof("JIRA user %s the request", resolution)
@@ -319,9 +339,9 @@ func (a *App) onJIRAWebhook(ctx context.Context, webhook Webhook) error {
 	return nil
 }
 
-func (a *App) onPendingRequest(ctx context.Context, req access.Request) error {
-	reqData := RequestData{User: req.User, Roles: req.Roles, RequestReason: req.RequestReason, Created: req.Created}
-	jiraData, err := a.bot.CreateIssue(ctx, req.ID, reqData)
+func (a *App) onPendingRequest(ctx context.Context, req types.AccessRequest) error {
+	reqData := RequestData{User: req.GetUser(), Roles: req.GetRoles(), RequestReason: req.GetRequestReason(), Created: req.GetCreationTime()}
+	jiraData, err := a.bot.CreateIssue(ctx, req.GetName(), reqData)
 
 	if err != nil {
 		return trace.Wrap(err)
@@ -332,14 +352,18 @@ func (a *App) onPendingRequest(ctx context.Context, req access.Request) error {
 		"jira_issue_key": jiraData.Key,
 	}).Info("JIRA Issue created")
 
-	err = a.setPluginData(ctx, req.ID, PluginData{reqData, jiraData})
+	if err := a.setPluginData(ctx, req.GetName(), PluginData{reqData, jiraData}); err != nil {
+		if trace.IsNotFound(err) {
+			return trace.Wrap(err, "failed to save plugin data, perhaps due to lack of permissions")
+		}
+		return trace.Wrap(err)
+	}
 
-	return trace.Wrap(err)
+	return nil
 }
 
-func (a *App) onDeletedRequest(ctx context.Context, req access.Request) error {
+func (a *App) onDeletedRequest(ctx context.Context, reqID string) error {
 	log := logger.Get(ctx)
-	reqID := req.ID // This is the only available field
 
 	pluginData, err := a.getPluginData(ctx, reqID)
 	if err != nil {
@@ -366,13 +390,29 @@ func (a *App) onDeletedRequest(ctx context.Context, req access.Request) error {
 }
 
 func (a *App) getPluginData(ctx context.Context, reqID string) (PluginData, error) {
-	dataMap, err := a.accessClient.GetPluginData(ctx, reqID)
+	data, err := a.apiClient.GetPluginData(ctx, types.PluginDataFilter{
+		Kind:     types.KindAccessRequest,
+		Resource: reqID,
+		Plugin:   pluginName,
+	})
 	if err != nil {
 		return PluginData{}, trace.Wrap(err)
 	}
-	return DecodePluginData(dataMap), nil
+	if len(data) == 0 {
+		return PluginData{}, nil
+	}
+	entry := data[0].Entries()[pluginName]
+	if entry == nil {
+		return PluginData{}, nil
+	}
+	return DecodePluginData(entry.Data), nil
 }
 
 func (a *App) setPluginData(ctx context.Context, reqID string, data PluginData) error {
-	return a.accessClient.UpdatePluginData(ctx, reqID, EncodePluginData(data), nil)
+	return a.apiClient.UpdatePluginData(ctx, types.PluginDataUpdateParams{
+		Kind:     types.KindAccessRequest,
+		Resource: reqID,
+		Plugin:   pluginName,
+		Set:      EncodePluginData(data),
+	})
 }

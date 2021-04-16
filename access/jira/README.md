@@ -39,7 +39,7 @@ make access-jira
 ```toml
 [teleport]
 auth_server = "example.com:3025"                       # Teleport Auth Server GRPC API address
-clientkey = "/var/lib/teleport/plugins/jira/auth.key"  # Teleport GRPC client secret key
+client_key = "/var/lib/teleport/plugins/jira/auth.key"  # Teleport GRPC client secret key
 client_crt = "/var/lib/teleport/plugins/jira/auth.crt" # Teleport GRPC client certificate
 root_cas = "/var/lib/teleport/plugins/jira/auth.cas"   # Teleport cluster CA certs
 
@@ -65,6 +65,16 @@ This configuration section ensures that the bot can talk to your teleport auth
 server & manage access-requests. Use `tctl auth sign --format=tls` to generate
 the required PEM files, and make sure that the Auth Server's GRPC API is
 accessible at the address indicated by `auth_server`.
+
+`auth_server` can also be a proxy (e.g. when using a plugin with Teleport Cloud),
+in that case use `tctl auth sign --format=file` to export the identity file
+containing SSH keys and set the `identity` file path in a config.
+
+```TOML
+[teleport]
+auth_server = "yourproxy.teleport.sh"            # Teleport proxy address
+identity = "/var/lib/teleport/plugins/jira/auth" # Teleport identity file
+```
 
 _NOTE_: The jira plugin must be given a teleport user identity with appropriate
 permissions. See the [access package README](../README.md#authentication) for an

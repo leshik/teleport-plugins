@@ -98,7 +98,7 @@ func (issue BotIssue) GetTransition(status string) (IssueTransition, error) {
 	return IssueTransition{}, trace.Errorf("cannot find a %q status among possible transitions", status)
 }
 
-func NewBot(conf JIRAConfig) *Bot {
+func NewBot(conf JIRAConfig, clusterName string) *Bot {
 	client := resty.NewWithClient(&http.Client{
 		Timeout: jiraHTTPTimeout,
 		Transport: &http.Transport{
@@ -126,7 +126,7 @@ func NewBot(conf JIRAConfig) *Bot {
 		}
 		return nil
 	})
-	return &Bot{client: client, project: conf.Project}
+	return &Bot{client: client, project: conf.Project, clusterName: clusterName}
 }
 
 func (b *Bot) HealthCheck(ctx context.Context) error {
