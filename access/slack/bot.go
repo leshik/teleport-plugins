@@ -41,6 +41,10 @@ func NewBot(conf Config, clusterName, webProxyAddr string) (Bot, error) {
 		if webProxyURL, err = url.Parse(webProxyAddr); err != nil {
 			return Bot{}, err
 		}
+		if webProxyURL.Scheme == "https" && webProxyURL.Port() == "443" {
+			// Cut off redundant :443
+			webProxyURL.Host = webProxyURL.Hostname()
+		}
 	}
 
 	httpClient := &http.Client{
