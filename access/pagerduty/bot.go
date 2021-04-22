@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"text/template"
 	"time"
@@ -44,14 +45,29 @@ func init() {
 // Bot is a wrapper around resty.Client.
 type Bot struct {
 	client    *resty.Client
-	server    *WebhookServer
 	from      string
 	serviceID string
 
 	clusterName string
+	webProxyURL *url.URL
 }
 
-func NewBot(conf PagerdutyConfig, server *WebhookServer) *Bot {
+func NewBot(conf PagerdutyConfig, clusterName, webProxyAddr string) (Bot, error) {
+	var webProxyURL *url.URL
+	if webProxyAddr != "" {
+		var err error
+		if !strings.HasPrefix(webProxyAddr, "http://") && !strings.HasPrefix(webProxyAddr, "https://") {
+			webProxyAddr = "https://" + webProxyAddr
+		}
+		if webProxyURL, err = url.Parse(webProxyAddr); err != nil {
+			return Bot{}, trace.Wrap(err)
+		}
+		if webProxyURL.Scheme == "https" && webProxyURL.Port() == "443" {
+			// Cut off redundant :443
+			webProxyURL.Host = webProxyURL.Hostname()
+		}
+	}
+
 	client := resty.NewWithClient(&http.Client{
 		Timeout: pdHTTPTimeout,
 		Transport: &http.Transport{
@@ -82,12 +98,13 @@ func NewBot(conf PagerdutyConfig, server *WebhookServer) *Bot {
 		}
 		return nil
 	})
-	return &Bot{
-		client:    client,
-		server:    server,
-		from:      conf.UserEmail,
-		serviceID: conf.ServiceID,
-	}
+	return Bot{
+		client:      client,
+		clusterName: clusterName,
+		webProxyURL: webProxyURL,
+		from:        conf.UserEmail,
+		serviceID:   conf.ServiceID,
+	}, nil
 }
 
 func (b *Bot) HealthCheck(ctx context.Context) error {
@@ -118,130 +135,7 @@ func (b *Bot) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-func (b *Bot) Setup(ctx context.Context) error {
-	var more bool
-	var offset uint
-
-	var webhookSchemaID string
-	for offset, more = 0, true; webhookSchemaID == "" && more; {
-		queryValues, err := query.Values(PaginationQuery{
-			Offset: offset,
-			Limit:  pdListLimit,
-		})
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		var result ListExtensionSchemasResult
-
-		_, err = b.client.NewRequest().
-			SetContext(ctx).
-			SetResult(&result).
-			SetQueryParamsFromValues(queryValues).
-			Get("extension_schemas")
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		for _, schema := range result.ExtensionSchemas {
-			if schema.Key == "custom_webhook" {
-				webhookSchemaID = schema.ID
-			}
-		}
-
-		more = result.More
-		offset += pdListLimit
-	}
-	if webhookSchemaID == "" {
-		return trace.NotFound(`failed to find "Custom Incident Action" extension type`)
-	}
-
-	var approveExtID, denyExtID string
-	for offset, more = 0, true; (approveExtID == "" || denyExtID == "") && more; {
-		queryValues, err := query.Values(ListExtensionsQuery{
-			PaginationQuery: PaginationQuery{
-				Offset: offset,
-				Limit:  pdListLimit,
-			},
-			ExtensionObjectID: b.serviceID,
-			ExtensionSchemaID: webhookSchemaID,
-		})
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		var result ListExtensionsResult
-
-		_, err = b.client.NewRequest().
-			SetContext(ctx).
-			SetResult(&result).
-			SetQueryParamsFromValues(queryValues).
-			Get("extensions")
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		for _, ext := range result.Extensions {
-			if ext.Name == pdApproveActionLabel {
-				approveExtID = ext.ID
-			}
-			if ext.Name == pdDenyActionLabel {
-				denyExtID = ext.ID
-			}
-		}
-
-		more = result.More
-		offset += pdListLimit
-	}
-
-	if err := b.setupCustomAction(ctx, approveExtID, webhookSchemaID, pdApproveAction, pdApproveActionLabel); err != nil {
-		return err
-	}
-	if err := b.setupCustomAction(ctx, denyExtID, webhookSchemaID, pdDenyAction, pdDenyActionLabel); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (b *Bot) setupCustomAction(ctx context.Context, extensionID, schemaID, actionName, actionLabel string) error {
-	actionURL := b.server.ActionURL(actionName)
-	body := ExtensionBody{
-		Name:        actionLabel,
-		EndpointURL: actionURL,
-		ExtensionSchema: Reference{
-			Type: "extension_schema_reference",
-			ID:   schemaID,
-		},
-		ExtensionObjects: []Reference{
-			{
-				Type: "service_reference",
-				ID:   b.serviceID,
-			},
-		},
-	}
-
-	if extensionID == "" {
-		_, err := b.client.NewRequest().
-			SetContext(ctx).
-			SetBody(&ExtensionBodyWrap{body}).
-			Post("extensions")
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		return nil
-	}
-	_, err := b.client.NewRequest().
-		SetContext(ctx).
-		SetBody(&ExtensionBodyWrap{body}).
-		Put(lib.BuildURLPath("extensions", extensionID))
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	return nil
-}
-
-func (b *Bot) CreateIncident(ctx context.Context, reqID string, reqData RequestData) (PagerdutyData, error) {
+func (b Bot) CreateIncident(ctx context.Context, reqID string, reqData RequestData) (PagerdutyData, error) {
 	bodyDetails, err := b.buildIncidentBody(reqID, reqData)
 	if err != nil {
 		return PagerdutyData{}, trace.Wrap(err)
@@ -275,7 +169,7 @@ func (b *Bot) CreateIncident(ctx context.Context, reqID string, reqData RequestD
 	}, nil
 }
 
-func (b *Bot) ResolveIncident(ctx context.Context, reqID, incidentID, resolution string) error {
+func (b Bot) ResolveIncident(ctx context.Context, reqID, incidentID, resolution string) error {
 	noteBody := IncidentNoteBody{
 		Content: fmt.Sprintf("Access request has been %s", resolution),
 	}
@@ -304,7 +198,7 @@ func (b *Bot) ResolveIncident(ctx context.Context, reqID, incidentID, resolution
 	return nil
 }
 
-func (b *Bot) GetUserInfo(ctx context.Context, userID string) (User, error) {
+func (b Bot) GetUserInfo(ctx context.Context, userID string) (User, error) {
 	var result UserResult
 
 	_, err := b.client.NewRequest().
@@ -318,7 +212,7 @@ func (b *Bot) GetUserInfo(ctx context.Context, userID string) (User, error) {
 	return result.User, nil
 }
 
-func (b *Bot) GetUserByEmail(ctx context.Context, userEmail string) (User, error) {
+func (b Bot) GetUserByEmail(ctx context.Context, userEmail string) (User, error) {
 	usersQuery, err := query.Values(ListUsersQuery{
 		Query: userEmail,
 		PaginationQuery: PaginationQuery{

@@ -2,30 +2,39 @@ package main
 
 import (
 	"context"
-	"net/url"
-	"strings"
 	"time"
 
-	"github.com/gravitational/teleport-plugins/access"
 	"github.com/gravitational/teleport-plugins/lib"
 	"github.com/gravitational/teleport-plugins/lib/logger"
+	"github.com/gravitational/teleport/api/client"
+	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/types"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 
 	"github.com/gravitational/trace"
 )
 
-// MinServerVersion is the minimal teleport version the plugin supports.
-const MinServerVersion = "4.3.0"
+const (
+	// minServerVersion is the minimal teleport version the plugin supports.
+	minServerVersion = "6.1.0-beta.1"
+	// pluginName is used to tag PluginData and as a Delegator in Audit log.
+	pluginName = "pagerduty"
+	// backoffMaxDelay is a maximum time GRPC client waits before reconnection attempt.
+	backoffMaxDelay = time.Second * 2
+	// initTimeout is used to bound execution time of health check and teleport version check.
+	initTimeout = time.Second * 10
+	// handlerTimeout is used to bound the execution time of watcher event handler.
+	handlerTimeout = time.Second * 5
+)
 
 // App contains global application state.
 type App struct {
 	conf Config
 
-	accessClient access.Client
-	bot          *Bot
-	webhookSrv   *WebhookServer
-	mainJob      lib.ServiceJob
+	apiClient *client.Client
+	bot       Bot
+	mainJob   lib.ServiceJob
 
 	*lib.Process
 }
@@ -55,83 +64,19 @@ func (a *App) WaitReady(ctx context.Context) (bool, error) {
 	return a.mainJob.WaitReady(ctx)
 }
 
-func (a *App) PublicURL() *url.URL {
-	if !a.mainJob.IsReady() {
-		panic("app is not running")
-	}
-	return a.webhookSrv.BaseURL()
-}
-
 func (a *App) run(ctx context.Context) error {
 	var err error
 
 	log := logger.Get(ctx)
-	log.Infof("Starting Teleport Access PagerDuty extension %s:%s", Version, Gitref)
+	log.Infof("Starting Teleport Access PagerDuty Plugin %s:%s", Version, Gitref)
 
-	a.webhookSrv, err = NewWebhookServer(a.conf.HTTP, a.onPagerdutyAction)
-	if err != nil {
+	if err = a.init(ctx); err != nil {
 		return trace.Wrap(err)
 	}
 
-	a.bot = NewBot(a.conf.Pagerduty, a.webhookSrv)
-
-	tlsConf, err := access.LoadTLSConfig(
-		a.conf.Teleport.ClientCrt,
-		a.conf.Teleport.ClientKey,
-		a.conf.Teleport.RootCAs,
-	)
-	if trace.Unwrap(err) == access.ErrInvalidCertificate {
-		log.WithError(err).Warning("Auth client TLS configuration error")
-	} else if err != nil {
-		return trace.Wrap(err)
-	}
-
-	bk := backoff.DefaultConfig
-	bk.MaxDelay = time.Second * 2
-	a.accessClient, err = access.NewClient(
-		ctx,
-		"pagerduty",
-		a.conf.Teleport.AuthServer,
-		tlsConf,
-		grpc.WithConnectParams(grpc.ConnectParams{
-			Backoff: bk,
-		}),
-	)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	if err = a.checkTeleportVersion(ctx); err != nil {
-		return trace.Wrap(err)
-	}
-
-	log.Debug("Starting PagerDuty API health check...")
-	if err = a.bot.HealthCheck(ctx); err != nil {
-		log.WithError(err).Error("PagerDuty API health check failed")
-		return trace.Wrap(err)
-	}
-	log.Debug("PagerDuty API health check finished ok")
-
-	err = a.webhookSrv.EnsureCert()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	httpJob := a.webhookSrv.ServiceJob()
-	a.SpawnCriticalJob(httpJob)
-	httpOk, err := httpJob.WaitReady(ctx)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	log.Debug("Setting up the webhook extensions")
-	if err = a.bot.Setup(ctx); err != nil {
-		log.WithError(err).Error("Failed to set up webhook extensions")
-		return trace.Wrap(err)
-	}
-	log.Debug("PagerDuty webhook extensions setup finished ok")
-
-	watcherJob := access.NewWatcherJob(
-		a.accessClient,
-		access.Filter{State: access.StatePending},
+	watcherJob := lib.NewWatcherJob(
+		a.apiClient,
+		types.Watch{Kinds: []types.WatchKind{types.WatchKind{Kind: types.KindAccessRequest}}},
 		a.onWatcherEvent,
 	)
 	a.SpawnCriticalJob(watcherJob)
@@ -140,41 +85,90 @@ func (a *App) run(ctx context.Context) error {
 		return trace.Wrap(err)
 	}
 
-	a.mainJob.SetReady(httpOk && watcherOk)
+	a.mainJob.SetReady(watcherOk)
 
-	<-httpJob.Done()
 	<-watcherJob.Done()
 
-	return trace.NewAggregate(httpJob.Err(), watcherJob.Err())
+	return trace.Wrap(watcherJob.Err())
 }
 
-func (a *App) checkTeleportVersion(ctx context.Context) error {
-	log := logger.Get(ctx)
-	log.Debug("Checking Teleport server version")
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+func (a *App) init(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
-	pong, err := a.accessClient.Ping(ctx)
-	if err != nil {
-		if trace.IsNotImplemented(err) {
-			return trace.Wrap(err, "server version must be at least %s", MinServerVersion)
-		}
-		log.Error("Unable to get Teleport server version")
+	log := logger.Get(ctx)
+
+	var (
+		err  error
+		pong proto.PingResponse
+	)
+
+	bk := backoff.DefaultConfig
+	bk.MaxDelay = backoffMaxDelay
+	if a.apiClient, err = client.New(ctx, client.Config{
+		Addrs:       []string{a.conf.Teleport.AuthServer},
+		Credentials: a.conf.Teleport.Credentials(),
+		DialOpts:    []grpc.DialOption{grpc.WithConnectParams(grpc.ConnectParams{Backoff: bk, MinConnectTimeout: initTimeout})},
+	}); err != nil {
 		return trace.Wrap(err)
 	}
-	a.bot.clusterName = pong.ClusterName
-	err = pong.AssertServerVersion(MinServerVersion)
-	return trace.Wrap(err)
+
+	if pong, err = a.checkTeleportVersion(ctx); err != nil {
+		return trace.Wrap(err)
+	}
+
+	var webProxyAddr string
+	if pong.ServerFeatures.AdvancedAccessWorkflows {
+		webProxyAddr = pong.ProxyPublicAddr
+	}
+	a.bot, err = NewBot(a.conf.Pagerduty, pong.ClusterName, webProxyAddr)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	log.Debug("Starting PagerDuty API health check...")
+	if err = a.bot.HealthCheck(ctx); err != nil {
+		return trace.Wrap(err, "api health check failed. check your credentials and service_id settings")
+	}
+	log.Debug("PagerDuty API health check finished ok")
+
+	return nil
 }
 
-func (a *App) onWatcherEvent(ctx context.Context, event access.Event) error {
-	req, op := event.Request, event.Type
-	ctx, _ = logger.WithField(ctx, "request_id", req.ID)
+func (a *App) checkTeleportVersion(ctx context.Context) (proto.PingResponse, error) {
+	log := logger.Get(ctx)
+	log.Debug("Checking Teleport server version")
+	pong, err := a.apiClient.WithCallOptions(grpc.WaitForReady(true)).Ping(ctx)
+	if err != nil {
+		if trace.IsNotImplemented(err) {
+			return pong, trace.Wrap(err, "server version must be at least %s", minServerVersion)
+		}
+		log.Error("Unable to get Teleport server version")
+		return pong, trace.Wrap(err)
+	}
+	err = lib.AssertServerVersion(pong, minServerVersion)
+	return pong, trace.Wrap(err)
+}
+
+func (a *App) onWatcherEvent(ctx context.Context, event types.Event) error {
+	ctx, cancel := context.WithTimeout(ctx, handlerTimeout)
+	defer cancel()
+
+	if kind := event.Resource.GetKind(); kind != types.KindAccessRequest {
+		return trace.Errorf("unexpected kind %q", kind)
+	}
+	op := event.Type
+	reqID := event.Resource.GetName()
+	ctx, _ = logger.WithField(ctx, "request_id", reqID)
 
 	switch op {
-	case access.OpPut:
+	case types.OpPut:
 		ctx, log := logger.WithField(ctx, "request_op", "put")
+		req, ok := event.Resource.(types.AccessRequest)
+		if !ok {
+			return trace.Errorf("unexpected resource type %T", event.Resource)
+		}
 
-		if !req.State.IsPending() {
+		if !req.GetState().IsPending() {
 			log.WithField("event", event).Warn("non-pending request event")
 			return nil
 		}
@@ -186,10 +180,10 @@ func (a *App) onWatcherEvent(ctx context.Context, event access.Event) error {
 			return err
 		}
 		return nil
-	case access.OpDelete:
+	case types.OpDelete:
 		ctx, log := logger.WithField(ctx, "request_op", "delete")
 
-		if err := a.onDeletedRequest(ctx, req); err != nil {
+		if err := a.onDeletedRequest(ctx, reqID); err != nil {
 			log := log.WithError(err)
 			log.Errorf("Failed to process deleted request")
 			log.Debugf("%v", trace.DebugReport(err))
@@ -201,74 +195,11 @@ func (a *App) onWatcherEvent(ctx context.Context, event access.Event) error {
 	}
 }
 
-func (a *App) onPagerdutyAction(ctx context.Context, action WebhookAction) error {
-	keyParts := strings.Split(action.IncidentKey, "/")
-	if len(keyParts) != 2 || keyParts[0] != pdIncidentKeyPrefix {
-		logger.Get(ctx).Warningf("Got unsupported incident key %q, ignoring", action.IncidentKey)
-		return nil
-	}
+func (a *App) onPendingRequest(ctx context.Context, req types.AccessRequest) error {
+	reqID := req.GetName()
+	reqData := RequestData{User: req.GetUser(), Roles: req.GetRoles(), Created: req.GetCreationTime()}
 
-	reqID := keyParts[1]
-	ctx, log := logger.WithField(ctx, "request_id", reqID)
-
-	req, err := a.accessClient.GetRequest(ctx, reqID)
-	if err != nil {
-		if trace.IsNotFound(err) {
-			log.WithError(err).Warning("Cannot process expired request")
-			return nil
-		}
-		return trace.Wrap(err)
-	}
-	if req.State != access.StatePending {
-		return trace.Errorf("cannot process not pending request: %+v", req)
-	}
-
-	ctx, log = logger.WithField(ctx, "pd_incident_id", action.IncidentID)
-
-	pluginData, err := a.getPluginData(ctx, reqID)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	if pluginData.PagerdutyData.ID == "" {
-		return trace.Errorf("plugin data is empty")
-	}
-
-	if pluginData.PagerdutyData.ID != action.IncidentID {
-		log.WithField("plugin_data_incident_id", pluginData.PagerdutyData.ID).Debug("plugin_data.incident_id does not match incident.id")
-		return trace.Errorf("incident_id from request's plugin_data does not match")
-	}
-
-	var userEmail, userName string
-	if userID := action.Agent.ID; userID != "" {
-		agent, err := a.bot.GetUserInfo(ctx, userID)
-		if err != nil {
-			log.WithError(err).Errorf("Cannot get user info by id %q", userID)
-		} else {
-			userEmail = agent.Email
-			userName = agent.Name
-		}
-	}
-
-	ctx, _ = logger.WithFields(ctx, logger.Fields{
-		"pd_user_email": userEmail,
-		"pd_user_name":  userName,
-	})
-
-	switch action.Name {
-	case pdApproveAction:
-		return a.setRequestState(ctx, req.ID, action.IncidentID, userEmail, access.StateApproved)
-	case pdDenyAction:
-		return a.setRequestState(ctx, req.ID, action.IncidentID, userEmail, access.StateDenied)
-	default:
-		return trace.BadParameter("unknown action: %q", action.Name)
-	}
-}
-
-func (a *App) onPendingRequest(ctx context.Context, req access.Request) error {
-	reqData := RequestData{User: req.User, Roles: req.Roles, Created: req.Created}
-
-	pdData, err := a.bot.CreateIncident(ctx, req.ID, reqData)
+	pdData, err := a.bot.CreateIncident(ctx, reqID, reqData)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -277,7 +208,7 @@ func (a *App) onPendingRequest(ctx context.Context, req access.Request) error {
 
 	log.Info("PagerDuty incident created")
 
-	err = a.setPluginData(ctx, req.ID, PluginData{reqData, pdData})
+	err = a.setPluginData(ctx, reqID, PluginData{reqData, pdData})
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -289,9 +220,8 @@ func (a *App) onPendingRequest(ctx context.Context, req access.Request) error {
 	return nil
 }
 
-func (a *App) onDeletedRequest(ctx context.Context, req access.Request) error {
+func (a *App) onDeletedRequest(ctx context.Context, reqID string) error {
 	log := logger.Get(ctx)
-	reqID := req.ID // This is the only available field
 
 	pluginData, err := a.getPluginData(ctx, reqID)
 	if err != nil {
@@ -317,20 +247,23 @@ func (a *App) onDeletedRequest(ctx context.Context, req access.Request) error {
 	return nil
 }
 
-func (a *App) setRequestState(ctx context.Context, reqID, incidentID, userEmail string, state access.State) error {
+func (a *App) setRequestState(ctx context.Context, reqID, incidentID, userEmail string, state types.RequestState) error {
 	log := logger.Get(ctx)
 	var resolution string
 
 	switch state {
-	case access.StateApproved:
+	case types.RequestState_APPROVED:
 		resolution = "approved"
-	case access.StateDenied:
+	case types.RequestState_DENIED:
 		resolution = "denied"
 	default:
 		return trace.Errorf("unable to set state to %v", state)
 	}
 
-	if err := a.accessClient.SetRequestState(ctx, reqID, state, userEmail); err != nil {
+	if err := a.apiClient.SetAccessRequestState(ctx, types.AccessRequestUpdate{
+		RequestID: reqID,
+		State:     state,
+	}); err != nil {
 		return trace.Wrap(err)
 	}
 	log.Infof("PagerDuty user %s the request", resolution)
@@ -343,15 +276,17 @@ func (a *App) setRequestState(ctx context.Context, reqID, incidentID, userEmail 
 	return nil
 }
 
-func (a *App) tryAutoApproveRequest(ctx context.Context, req access.Request, incidentID string) error {
+func (a *App) tryAutoApproveRequest(ctx context.Context, req types.AccessRequest, incidentID string) error {
 	log := logger.Get(ctx)
 
-	if !lib.IsEmail(req.User) {
-		logger.Get(ctx).Warningf("Failed to auto-approve the request: %q does not look like a valid email", req.User)
+	userName := req.GetUser()
+
+	if !lib.IsEmail(userName) {
+		logger.Get(ctx).Warningf("Failed to auto-approve the request: %q does not look like a valid email", userName)
 		return nil
 	}
 
-	user, err := a.bot.GetUserByEmail(ctx, req.User)
+	user, err := a.bot.GetUserByEmail(ctx, userName)
 	if err != nil {
 		if trace.IsNotFound(err) {
 			log.WithError(err).Debugf("Failed to auto-approve the request")
@@ -371,7 +306,7 @@ func (a *App) tryAutoApproveRequest(ctx context.Context, req access.Request, inc
 	}
 	if isOnCall {
 		log.Infof("User is now on-call, auto-approving the request")
-		return a.setRequestState(ctx, req.ID, incidentID, user.Email, access.StateApproved)
+		return a.setRequestState(ctx, req.GetName(), incidentID, user.Email, types.RequestState_APPROVED)
 	}
 
 	log.Debug("User is not on call")
@@ -379,13 +314,29 @@ func (a *App) tryAutoApproveRequest(ctx context.Context, req access.Request, inc
 }
 
 func (a *App) getPluginData(ctx context.Context, reqID string) (PluginData, error) {
-	dataMap, err := a.accessClient.GetPluginData(ctx, reqID)
+	data, err := a.apiClient.GetPluginData(ctx, types.PluginDataFilter{
+		Kind:     types.KindAccessRequest,
+		Resource: reqID,
+		Plugin:   pluginName,
+	})
 	if err != nil {
 		return PluginData{}, trace.Wrap(err)
 	}
-	return DecodePluginData(dataMap), nil
+	if len(data) == 0 {
+		return PluginData{}, nil
+	}
+	entry := data[0].Entries()[pluginName]
+	if entry == nil {
+		return PluginData{}, nil
+	}
+	return DecodePluginData(entry.Data), nil
 }
 
 func (a *App) setPluginData(ctx context.Context, reqID string, data PluginData) error {
-	return a.accessClient.UpdatePluginData(ctx, reqID, EncodePluginData(data), nil)
+	return a.apiClient.UpdatePluginData(ctx, types.PluginDataUpdateParams{
+		Kind:     types.KindAccessRequest,
+		Resource: reqID,
+		Plugin:   pluginName,
+		Set:      EncodePluginData(data),
+	})
 }

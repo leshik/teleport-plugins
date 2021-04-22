@@ -1,11 +1,6 @@
 package main
 
 import (
-	"crypto/tls"
-	"crypto/x509"
-	"io/ioutil"
-	"os"
-
 	"github.com/gravitational/teleport-plugins/lib"
 	"github.com/gravitational/teleport-plugins/lib/logger"
 	"github.com/gravitational/trace"
@@ -15,7 +10,6 @@ import (
 type Config struct {
 	Teleport  lib.TeleportConfig `toml:"teleport"`
 	Pagerduty PagerdutyConfig    `toml:"pagerduty"`
-	HTTP      lib.HTTPConfig     `toml:"http"`
 	Log       logger.Config      `toml:"log"`
 }
 
@@ -95,15 +89,6 @@ func (c *Config) CheckAndSetDefaults() error {
 	if c.Pagerduty.ServiceID == "" {
 		return trace.BadParameter("missing required value pagerduty.service_id")
 	}
-	if c.HTTP.PublicAddr == "" {
-		return trace.BadParameter("missing required value http.public_addr")
-	}
-	if c.HTTP.ListenAddr == "" {
-		c.HTTP.ListenAddr = ":8081"
-	}
-	if err := c.HTTP.Check(); err != nil {
-		return trace.Wrap(err)
-	}
 	if c.Log.Output == "" {
 		c.Log.Output = "stderr"
 	}
@@ -111,29 +96,4 @@ func (c *Config) CheckAndSetDefaults() error {
 		c.Log.Severity = "info"
 	}
 	return nil
-}
-
-// LoadTLSConfig loads client crt/key files and root authorities, and
-// generates a tls.Config suitable for use with a GRPC client.
-func (c *Config) LoadTLSConfig() (*tls.Config, error) {
-	var tc tls.Config
-	clientCert, err := tls.LoadX509KeyPair(c.Teleport.ClientCrt, c.Teleport.ClientKey)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	tc.Certificates = append(tc.Certificates, clientCert)
-	caFile, err := os.Open(c.Teleport.RootCAs)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	caCerts, err := ioutil.ReadAll(caFile)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	pool := x509.NewCertPool()
-	if ok := pool.AppendCertsFromPEM(caCerts); !ok {
-		return nil, trace.BadParameter("invalid CA cert PEM")
-	}
-	tc.RootCAs = pool
-	return &tc, nil
 }
